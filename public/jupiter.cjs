@@ -468,7 +468,7 @@ function getKeypair() {
   if (envKey) {
     try {
       _kp = parseKeypairFromInput(envKey);
-      log(`[${NETWORK}] âœ… Loaded wallet from environment secret: ${_kp.publicKey.toBase58()}`);
+      log(`[${NETWORK}] ✅ Loaded wallet from environment secret: ${_kp.publicKey.toBase58()}`);
       return _kp;
     } catch (envErr) {
       log(`[${NETWORK}] [WARNING] Could not parse environment private key: ${envErr.message}`);
@@ -493,7 +493,7 @@ function getKeypair() {
   try {
     const fileContent = fs.readFileSync(activeKeypairPath, 'utf8').trim();
     _kp = parseKeypairFromInput(fileContent);
-    log(`[${NETWORK}] âœ… Loaded Mainnet Keypair from: ${activeKeypairPath}`);
+    log(`[${NETWORK}] ✅ Loaded Mainnet Keypair from: ${activeKeypairPath}`);
     log(`[${NETWORK}] Wallet Public Key: ${_kp.publicKey.toBase58()}`);
     return _kp;
   } catch (err) {
@@ -1695,7 +1695,7 @@ async function placeLimitOrder({ asset, side, marginUSDC, limitPrice, leverage, 
           });
 
           if (sim.value.err) {
-            log(`[${NETWORK}] âŒ [APPROACH B SIMULATION REJECTED]:`, JSON.stringify(sim.value.err));
+            log(`[${NETWORK}] ❌ [APPROACH B SIMULATION REJECTED]:`, JSON.stringify(sim.value.err));
             if (sim.value.logs) {
               log(`[SIMULATION LOGS]:\n` + sim.value.logs.slice(-10).join('\n'));
             }
@@ -1703,7 +1703,7 @@ async function placeLimitOrder({ asset, side, marginUSDC, limitPrice, leverage, 
               throw new Error(`Simulation failed on-chain: ${JSON.stringify(sim.value.err)}`);
             }
           } else {
-            log(`[${NETWORK}] âœ… [APPROACH B SIMULATION PASSED!]`);
+            log(`[${NETWORK}] ✅ [APPROACH B SIMULATION PASSED!]`);
             log(`[${NETWORK}] Compute units consumed: ${sim.value.unitsConsumed}`);
             if (sim.value.logs && sim.value.logs.length > 0) {
               log(`[${NETWORK}] Execution log sample: ${sim.value.logs.slice(-2).join(' | ')}`);
@@ -1742,7 +1742,7 @@ async function placeLimitOrder({ asset, side, marginUSDC, limitPrice, leverage, 
         openedAt: Date.now(),
       };
       savePaperStore();
-      log(`[${NETWORK}] âœ… [APPROACH A PAPER TRADE CREATED]`);
+      log(`[${NETWORK}] ✅ [APPROACH A PAPER TRADE CREATED]`);
       log(`[${NETWORK}] Virtual Position: ${normSide} ${assetClean} | Size: $${marginUSDC * leverage} | ID: ${paperId}`);
       return paperId;
     }
@@ -2156,7 +2156,7 @@ async function closePosition(positionPubkey) {
       paperPos.status = 'closed';
       paperPos.closedAt = Date.now();
       savePaperStore();
-      log(`[${NETWORK}] âœ… [APPROACH A] Paper position closed: ${positionPubkey}`);
+      log(`[${NETWORK}] ✅ [APPROACH A] Paper position closed: ${positionPubkey}`);
       return positionPubkey;
     }
     log(`[${NETWORK}] [APPROACH A] Paper position not found or already closed`);
