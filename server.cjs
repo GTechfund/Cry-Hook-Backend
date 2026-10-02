@@ -22,8 +22,11 @@ app.use((req, res, next) => {
   if (
     url.startsWith('/api/binance/') ||
     url.startsWith('/api/bot/') ||
+    url.startsWith('/api/trades') ||
     url.startsWith('/autotrade') ||
     url.startsWith('/order/') ||
+    url === '/portfolio-balance' ||
+    url === '/balance' ||
     url === '/signal' ||
     url === '/cancel' ||
     url === '/close' ||

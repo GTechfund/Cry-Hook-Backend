@@ -18,15 +18,15 @@ const TIERS = {
     maxBalance: 99.9999,
     maxOpenPositions: 1, // $0 - $99.99 allows strictly 1 position
     leverage: 20,
-    riskCapPct: 0.10, // 10% of equity
-    maxRiskDollarCap: 3.00, // Maximum -$3.00 loss
-    tp1Dist: 0.30,
-    tp2Dist: 0.55,
-    tp2AtrMult: 0.85,
-    slAtrMult: 1.8,
-    defaultMargin: 11.0,
-    compoundRate: 0.15,
-    description: 'Capital preservation for micro-balances ($0-$100). 20x leverage keeps fee drag < 1.6% and limits loss to ~$0.65 - $3.00 max.',
+    riskCapPct: 0.01, // 1% equity risk (-$0.30 max loss on a $30 starting balance)
+    maxRiskDollarCap: 1.00, // Maximum -$1.00 loss
+    tp1Dist: 0.18, // Calibrated +18¢ quick scalp TP (locks +$1.50-$2.00 on $10.50 margin)
+    tp2Dist: 0.32, // Calibrated +32¢ runner target (+0.55 ATR)
+    tp2AtrMult: 0.55,
+    slAtrMult: 1.2,
+    defaultMargin: 10.50,
+    compoundRate: 0.35, // 35% of balance (~$10.50 margin on $30)
+    description: 'Capital preservation for micro-balances ($0-$100). Capped at 1% equity risk (-$0.30 max loss on $30 balance) with +0.55 ATR TP2.',
   },
   TIER_2_HYBRID: {
     id: 'TIER_2_HYBRID',
@@ -35,15 +35,15 @@ const TIERS = {
     maxBalance: 249.9999,
     maxOpenPositions: 2, // $100 - $249.99 allows up to 2 positions
     leverage: 35,
-    riskCapPct: 0.10, // 10% of equity
-    maxRiskDollarCap: 10.00, // Maximum -$10.00 loss
+    riskCapPct: 0.05, // 5% equity risk (-$5.00 max loss on $100 balance)
+    maxRiskDollarCap: 12.50, // Maximum -$12.50 loss
     tp1Dist: 0.35,
-    tp2Dist: 0.70,
-    tp2AtrMult: 1.00,
-    slAtrMult: 1.6,
+    tp2Dist: 0.65, // Calibrated +0.85 ATR runner target
+    tp2AtrMult: 0.85,
+    slAtrMult: 1.5,
     defaultMargin: 25.0,
     compoundRate: 0.25,
-    description: 'Balanced acceleration for intermediate balances ($100-$250). 35x leverage with widened TP2 to capture multi-candle extensions.',
+    description: 'Balanced acceleration for intermediate balances ($100-$250). Capped at 5% equity risk (-$5.00 max loss on $100) with +0.85 ATR TP2.',
   },
   TIER_3_ALPHA: {
     id: 'TIER_3_ALPHA',
@@ -52,15 +52,15 @@ const TIERS = {
     maxBalance: Infinity,
     maxOpenPositions: 3, // $250+ allows up to 3 positions
     leverage: 50,
-    riskCapPct: 0.10, // 10% of equity
-    maxRiskDollarCap: 25.00, // Maximum -$25.00 loss
+    riskCapPct: 0.10, // 10% equity risk (-$25.00 max loss on $250 balance)
+    maxRiskDollarCap: 50.00, // Maximum -$50.00 loss
     tp1Dist: 0.35,
-    tp2Dist: 0.85,
+    tp2Dist: 0.85, // Calibrated +1.20 ATR runner target
     tp2AtrMult: 1.20,
     slAtrMult: 1.5,
     defaultMargin: 60.0,
     compoundRate: 0.35,
-    description: 'Maximum velocity compounding for accounts $250+. 50x leverage captures full macro drift moves with a strict $25 risk cap.',
+    description: 'Maximum velocity compounding for accounts $250+. Capped at 10% equity risk (-$25.00 max loss on $250) with +1.20 ATR TP2.',
   },
 };
 
@@ -156,23 +156,72 @@ function evaluateTradeSignal(currentSignal = {}, accountBalance = 240, barIndex)
     };
   }
 
-  // 3. Compute Risk Cap for this Trade
-  // Enforces 10% equity risk cap, capped at tier max ($3.00 for Tier 1, $10.00 for Tier 2, $25.00 for Tier 3)
-  const equityRisk10Pct = balance * preset.riskCapPct;
-  const maxDollarLoss = Math.min(equityRisk10Pct, preset.maxRiskDollarCap);
-
-  // 4. Compute Margin & Position Sizing
-  const compoundRate = currentSignal.compoundRate !== undefined ? currentSignal.compoundRate : preset.compoundRate;
-  let margin = 0;
-  if (compoundRate === 0) {
-    margin = preset.defaultMargin;
-  } else {
-    margin = Math.max(11.0, balance * compoundRate);
+  // 2.1 Ultra-Low ADX Filter (ADX < 12 with Volume > 35K -> Forced Yellow Standby / 0x Leverage Sit-Out)
+  const adxVal = parseFloat(currentSignal.adx) || 25;
+  const volVal = parseFloat(currentSignal.volume) || 0;
+  if (adxVal < 12 && (volVal > 35000 || currentSignal.volOK)) {
+    return {
+      execute: false,
+      reason: `ULTRA_LOW_ADX_CHOP: ADX (14) = ${adxVal.toFixed(1)} < 12 with Volume > 35K. Forcing Yellow Standby / 0x Leverage Sit-Out.`,
+      preset,
+      tier: preset.id,
+      balance,
+      circuitBreaker: { active: false, standbyBarsRemaining: 0, consecutiveLosses: state.consecutiveLosses },
+    };
   }
 
-  // Cap margin so that a standard stop loss does not instantly exceed maxDollarLoss
-  const leverage = preset.leverage;
-  const notional = margin * leverage;
+  // 2.2 Regime-Optimized Base Leverage Adjusters & 0x Sit-Out
+  const regime = currentSignal.regime || 'RANGE_BOUND_SUPPORT';
+  const setupGrade = currentSignal.setupGrade || 'GRADE_B';
+  const signalType = (currentSignal.direction || currentSignal.signal || 'green').toLowerCase();
+
+  // 0x Sit-Out during Market Chop or Yellow Standby
+  if (regime === 'MARKET_CHOP' || signalType === 'yellow' || signalType === 'standby') {
+    return {
+      execute: false,
+      reason: `MARKET_CHOP_SITOUT: Regime is ${regime} / Signal is ${signalType}. 0x Leverage Sit-Out enforced.`,
+      preset,
+      tier: preset.id,
+      balance,
+      circuitBreaker: { active: false, standbyBarsRemaining: 0, consecutiveLosses: state.consecutiveLosses },
+    };
+  }
+
+  let effectiveLeverage = preset.leverage;
+  // +10x Boost on Bull Trend Drift / Grade A setups (e.g. 20x -> 30x)
+  if (regime === 'BULL_TREND_DRIFT' || setupGrade === 'GRADE_A') {
+    effectiveLeverage += 10;
+  }
+  // -10x Reduction on Counter-Trend / Flash Crash setups (e.g. 20x -> 10x)
+  else if (regime === 'FLASH_CRASH_VOLATILITY' || regime === 'BEAR_TREND' || setupGrade === 'GRADE_C') {
+    effectiveLeverage = Math.max(5, effectiveLeverage - 10);
+  }
+
+  // Manual UI Override: support manual UI leverage adjustment offsets (manualLeverageOffset)
+  if (typeof currentSignal.manualLeverageOffset === 'number' && !isNaN(currentSignal.manualLeverageOffset)) {
+    effectiveLeverage = Math.max(5, Math.min(60, effectiveLeverage + currentSignal.manualLeverageOffset));
+  }
+
+  // 3. Compute Scalable Stop Loss Risk Cap for this Trade
+  // Tier 1: 1% equity risk (-$0.30 max loss on a $30 starting balance)
+  // Tier 2: 5% equity risk (-$5.00 max loss on $100 balance)
+  // Tier 3: 10% equity risk (-$25.00 max loss on $250 balance)
+  const equityRiskDollar = balance * preset.riskCapPct;
+  const maxDollarLoss = Math.max(0.15, Math.min(equityRiskDollar, preset.maxRiskDollarCap));
+
+  // 4. Compute Margin with $500 Maximum Hard Dollar Margin Ceiling
+  const compoundRate = currentSignal.compoundRate !== undefined ? currentSignal.compoundRate : preset.compoundRate;
+  let rawMargin = 0;
+  if (compoundRate === 0) {
+    rawMargin = preset.defaultMargin;
+  } else {
+    rawMargin = Math.max(10.5, balance * compoundRate);
+  }
+
+  // Hard Dollar Margin Ceiling ($500 max per trade): Bounds single-trade committed margin
+  // to $500 max per trade ($25,000 maximum nominal size at 50x) within Jupiter primary liquidity tier.
+  const margin = Math.min(500.0, rawMargin);
+  const notional = margin * effectiveLeverage;
 
   // 5. Dynamic Targets (Fee-Neutral TP1 and Dynamic TP2)
   const price = parseFloat(currentSignal.price) || 140.0;
@@ -198,7 +247,8 @@ function evaluateTradeSignal(currentSignal = {}, accountBalance = 240, barIndex)
   const direction = (currentSignal.direction || currentSignal.side || 'Long').toLowerCase();
   const isLong = direction === 'long' || direction === 'buy' || direction === 'green';
 
-  const entryOffset = Math.max(0.08, parseFloat(currentSignal.entryOffset) || 0.25 * curATR);
+  const minOffset = preset.id === 'TIER_1_MICRO' ? 0.02 : 0.05;
+  const entryOffset = Math.max(minOffset, parseFloat(currentSignal.entryOffset) || (preset.id === 'TIER_1_MICRO' ? 0.03 : 0.18 * curATR));
   const entryPrice = isLong ? price - entryOffset : price + entryOffset;
   const stopLoss = isLong ? entryPrice - effectiveSlDist : entryPrice + effectiveSlDist;
   const takeProfit1 = isLong ? entryPrice + tp1Dist : entryPrice - tp1Dist;
@@ -215,7 +265,10 @@ function evaluateTradeSignal(currentSignal = {}, accountBalance = 240, barIndex)
       maxRiskDollarCap: preset.maxRiskDollarCap,
     },
     tier: preset.id,
-    leverage: preset.leverage,
+    baseLeverage: preset.leverage,
+    leverage: effectiveLeverage,
+    maxMarginUsd: 500,
+    maxSlippageBps: 5,
     margin: parseFloat(margin.toFixed(2)),
     notional: parseFloat(notional.toFixed(2)),
     entryPrice: parseFloat(entryPrice.toFixed(4)),

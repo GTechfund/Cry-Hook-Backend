@@ -214,14 +214,18 @@ const state = {
     error: null,
   },
   isHalted: false,
-  balance: 240.0,
+  balance: 30.0,
+  isCustomBalanceSet: true,
   dailyPnL: 0.0,
   autoTrade: {
     enabled: true,
     lastSignalTime: null,
-    maxOpenOrders: 2,
+    maxOpenOrders: 1,
   },
   orders: {}, // keyed by requestPDA
+  trades: [], // Unified ledger of executed trades (AUTOTRADE_BOT and MANUAL_UI)
+  currentSignal: null,
+  marketIndicators: null,
 };
 
 // Seed with the initial order from user prompt
@@ -260,7 +264,11 @@ try {
       if (parsed.orders && Object.keys(parsed.orders).length > 0) {
         Object.assign(state.orders, parsed.orders);
       }
+      if (Array.isArray(parsed.trades)) {
+        state.trades = parsed.trades;
+      }
       if (typeof parsed.balance === 'number') state.balance = parsed.balance;
+      if (typeof parsed.isCustomBalanceSet === 'boolean') state.isCustomBalanceSet = parsed.isCustomBalanceSet;
       if (typeof parsed.dailyPnL === 'number') state.dailyPnL = parsed.dailyPnL;
       if (parsed.wallet && typeof parsed.wallet.solBalance === 'number') {
         state.wallet.solBalance = parsed.wallet.solBalance;
@@ -284,6 +292,7 @@ function persistState() {
       JSON.stringify(
         {
           orders: state.orders,
+          trades: state.trades || [],
           balance: state.balance,
           dailyPnL: state.dailyPnL,
           wallet: {
@@ -595,20 +604,84 @@ function updateMarketPrice(asset, price) {
         }
       }
 
-      // 2. If filled, manage active trade (Improvements B, D, F + Risk Controls)
+      // 2. If filled, manage active trade (Early Bank 70%, Scalable Risk Caps, Quick Chandelier)
       if (ord.status === 'filled') {
         ord.highestPrice = Math.max(ord.highestPrice || ord.entryPrice, price);
         const priceGain = ord.side === 'Long' ? price - ord.entryPrice : ord.entryPrice - price;
         const barsHeld = Math.floor((Date.now() - (ord.filledAt || Date.now())) / (15 * 60 * 1000));
 
-        // Hard Account Equity Risk Cap (Max 10% Equity Risk):
-        // Enforce maximum dollar loss on any single trade to 10% of current account equity
-        const maxEquityLossUsd = Math.max(1.0, (state.balance || 240.0) * 0.10);
+        // 2) Scalable Stop Loss Risk Caps (Balance-Based Risk Tiers)
+        // Tier 1 ($0.00 – $99.99): 1% equity risk (-$0.30 max loss on $30 balance)
+        // Tier 2 ($100.00 – $249.99): 5% equity risk (-$5.00 max loss on $100 balance)
+        // Tier 3 ($250.00+): 10% equity risk (-$25.00 max loss on $250 balance)
+        const curBal = state.balance || 30.0;
+        let riskTierPct = 0.01;
+        if (curBal >= 250.00) riskTierPct = 0.10;
+        else if (curBal >= 100.00) riskTierPct = 0.05;
+        const maxEquityLossUsd = Math.max(0.15, Math.min(ord.maxDollarLoss || Infinity, curBal * riskTierPct));
 
-        // Fee-Neutral Trailing Ratchet (+10¢ Lock):
-        // Ratchet stop loss to Entry + $0.10 once price gains +$0.10, locking in micro-gains
+        // 3) Quick Change Chandelier Trailing Stop Loss (Signal Flip Protection)
+        // If trade was entered on GREEN signal and live signal flips to RED or YELLOW before touching TP1 (+0.35 ATR),
+        // override baseline SL and engage immediate 0.8× ATR Chandelier Trailing Stop below highest price reached.
+        const liveSig = ((state.currentSignal && state.currentSignal.signal) || (state.marketIndicators && state.marketIndicators.signal) || 'green').toLowerCase();
+        const signalFlipped = !ord.tp1Hit && !ord.earlyBankHit && (
+          (ord.side === 'Long' && (liveSig === 'red' || liveSig === 'yellow')) ||
+          (ord.side === 'Short' && (liveSig === 'green' || liveSig === 'yellow'))
+        );
+
+        if (signalFlipped) {
+          const curATR = ord.atr || (state.marketIndicators && state.marketIndicators.atr) || 0.35;
+          const chandelierOffset = 0.8 * curATR;
+          const chandelierSL = ord.side === 'Long'
+            ? parseFloat((ord.highestPrice - chandelierOffset).toFixed(4))
+            : parseFloat((ord.highestPrice + chandelierOffset).toFixed(4));
+
+          if (ord.side === 'Long' && chandelierSL > ord.stopLoss) {
+            ord.stopLoss = chandelierSL;
+            ord.isChandelierRatchet = true;
+            ord.keeperStatus = `[Quick Change Chandelier] Signal flipped to ${liveSig.toUpperCase()} before TP1: Engaged 0.8× ATR Chandelier Stop @ $${ord.stopLoss} below peak $${ord.highestPrice.toFixed(2)}`;
+          } else if (ord.side === 'Short' && chandelierSL < ord.stopLoss) {
+            ord.stopLoss = chandelierSL;
+            ord.isChandelierRatchet = true;
+            ord.keeperStatus = `[Quick Change Chandelier] Signal flipped to ${liveSig.toUpperCase()} before TP1: Engaged 0.8× ATR Chandelier Stop @ $${ord.stopLoss} above peak $${ord.highestPrice.toFixed(2)}`;
+          }
+        }
+
+        // 1) The 70% Distance Progress Threshold (Dynamic Early Bank Rule)
+        // Trigger Condition: Price reaches >= 70% of distance to TP1 (+0.245 ATR / e.g. $118.45)
+        // and 5m momentum oscillator (Fisher or CCI) rolls over / stalls out before touching full TP1.
+        // Action Taken: Early Bank 50% of position at active market bid.
+        // Proceed to TP2?: YES. Remaining 50% runner proceeds to TP2, stop loss instantly ratchets to Entry + $0.10.
+        const targetTp1Dist = ord.tp1 || 0.35;
+        const progressToTp1 = targetTp1Dist > 0 ? (priceGain / targetTp1Dist) : 0;
+        const momentumStalled = Boolean(
+          ord.momentumStall ||
+          (state.marketIndicators && (state.marketIndicators.fisher5mBearishCross || state.marketIndicators.fisher5mUp === false || state.marketIndicators.cciUp === false)) ||
+          (ord.side === 'Long' && ord.highestPrice > ord.entryPrice && price <= (ord.highestPrice - 0.03)) ||
+          (ord.side === 'Short' && ord.highestPrice < ord.entryPrice && price >= (ord.highestPrice + 0.03))
+        );
+
+        if (!ord.earlyBankHit && !ord.tp1Hit && progressToTp1 >= 0.70 && momentumStalled && priceGain > 0) {
+          ord.earlyBankHit = true;
+          ord.tp1Hit = true; // proceeds to TP2 runner mode
+          const earlyBankRatio = 0.50; // Bank 50%
+          const bankedPnL = (priceGain / ord.entryPrice) * (ord.notional * earlyBankRatio);
+          ord.pnl = parseFloat(((ord.pnl || 0) + bankedPnL).toFixed(2));
+          state.balance = parseFloat((state.balance + bankedPnL).toFixed(2));
+          state.dailyPnL = parseFloat((state.dailyPnL + bankedPnL).toFixed(2));
+
+          // Retain remaining 50% runner position for TP2
+          ord.notional = parseFloat((ord.notional * (1 - earlyBankRatio)).toFixed(2));
+          ord.margin = parseFloat((ord.margin * (1 - earlyBankRatio)).toFixed(2));
+
+          // Stop loss instantly ratchets to Entry + $0.10
+          ord.stopLoss = ord.side === 'Long' ? parseFloat((ord.entryPrice + 0.10).toFixed(4)) : parseFloat((ord.entryPrice - 0.10).toFixed(4));
+          ord.keeperStatus = `[Early Bank 70%] Reached ≥70% TP1 (+${(progressToTp1 * 100).toFixed(0)}%) & 5m Momentum Stalled: Banked 50% ($${bankedPnL.toFixed(2)}). Runner locked at Entry + 10¢ ($${ord.stopLoss}) proceeding to TP2 ($${ord.takeProfit.toFixed(2)})`;
+        }
+
+        // Fee-Neutral Trailing Ratchet (+10¢ Lock) on baseline moves
         const lockThreshold = 0.10;
-        if (priceGain >= lockThreshold && !ord.tp1Hit) {
+        if (priceGain >= lockThreshold && !ord.tp1Hit && !ord.earlyBankHit) {
           const ratchetedSL = ord.side === 'Long'
             ? Math.max(ord.stopLoss, ord.entryPrice + 0.10)
             : Math.min(ord.stopLoss, ord.entryPrice - 0.10);
@@ -622,21 +695,21 @@ function updateMarketPrice(asset, price) {
         // Automatically exit positions if they fail to reach TP1 within 3 bars (~45 min)
         // while moving adverse by more than -0.30 ATR (~$0.15)
         const adversePrice = ord.side === 'Long' ? ord.entryPrice - price : price - ord.entryPrice;
-        if (!ord.tp1Hit && barsHeld >= 3 && adversePrice > 0.15) {
+        if (!ord.tp1Hit && !ord.earlyBankHit && barsHeld >= 3 && adversePrice > 0.15) {
           closeOrder(pda, price, 'STAGNATION_EXIT (Failed TP1 in 3 bars with adverse move)');
           continue;
         }
 
-        // Hard Account Equity Cap Check during active drawdown
+        // Hard Account Equity Cap Check during active drawdown (Tier 1: 1%, Tier 2: 5%, Tier 3: 10%)
         const currentFloatingLoss = ord.side === 'Long' 
           ? ((ord.entryPrice - price) / ord.entryPrice) * ord.notional
           : ((price - ord.entryPrice) / ord.entryPrice) * ord.notional;
         if (currentFloatingLoss >= maxEquityLossUsd) {
-          closeOrder(pda, price, `EQUITY_RISK_CAP_HIT (Loss reached 10% equity cap: -$${maxEquityLossUsd.toFixed(2)})`);
+          closeOrder(pda, price, `EQUITY_RISK_CAP_HIT (Loss reached ${(riskTierPct * 100).toFixed(0)}% tier cap: -$${maxEquityLossUsd.toFixed(2)})`);
           continue;
         }
 
-        // Improvement B: Asymmetric TP1 Scale-Out
+        // Standard Full TP1 Scale-Out (if early bank was not triggered first)
         const tp1Price = ord.side === 'Long' ? ord.entryPrice + (ord.tp1 || 0.35) : ord.entryPrice - (ord.tp1 || 0.35);
         if (!ord.tp1Hit && ((ord.side === 'Long' && price >= tp1Price) || (ord.side === 'Short' && price <= tp1Price))) {
           ord.tp1Hit = true;
@@ -655,7 +728,7 @@ function updateMarketPrice(asset, price) {
           ord.keeperStatus = `[Imp B] TP1 Hit ($${tp1Price.toFixed(2)}): Banked ${ord.tp1Percent}% ($${bankedPnL.toFixed(2)}). Runner locked at +10¢ trailing to TP2 ($${ord.takeProfit.toFixed(2)})`;
         }
 
-        // Improvement F: Dynamic Chandelier Trailing Stop (1.2× ATR)
+        // Improvement F: Dynamic Chandelier Trailing Stop (1.2× ATR) for runners
         if (ord.tp1Hit && ord.trailingStopOffset) {
           const trailSL = ord.side === 'Long'
             ? ord.highestPrice - ord.trailingStopOffset
@@ -672,7 +745,7 @@ function updateMarketPrice(asset, price) {
         // Unrealized PnL calculation on remaining notional
         const remainingGain = ord.side === 'Long' ? price - ord.entryPrice : ord.entryPrice - price;
         const currentUnrealized = (remainingGain / ord.entryPrice) * ord.notional;
-        const totalPnL = parseFloat(((ord.pnl || 0) + (ord.tp1Hit ? currentUnrealized : currentUnrealized)).toFixed(2));
+        const totalPnL = parseFloat(((ord.pnl || 0) + currentUnrealized).toFixed(2));
         ord.pnlPercent = ord.margin > 0 ? parseFloat(((totalPnL / ord.margin) * 100).toFixed(2)) : 0;
 
         // Check TP2 / Final Take Profit
@@ -681,7 +754,7 @@ function updateMarketPrice(asset, price) {
         }
         // Check Stop Loss / Trailing Stop
         else if ((ord.side === 'Long' && price <= ord.stopLoss) || (ord.side === 'Short' && price >= ord.stopLoss)) {
-          closeOrder(pda, ord.stopLoss, ord.tp1Hit ? 'TRAILING_STOP_HIT' : 'STOP_LOSS_HIT');
+          closeOrder(pda, ord.stopLoss, (ord.tp1Hit || ord.earlyBankHit || ord.isChandelierRatchet) ? 'TRAILING_STOP_HIT' : 'STOP_LOSS_HIT');
         }
       }
     }
@@ -696,6 +769,7 @@ function fillOrder(pda, fillPrice) {
 
   ord.status = 'filled';
   ord.filledAt = Date.now();
+  ord.timestampEntry = new Date(ord.filledAt).toISOString();
   ord.entryPrice = fillPrice || ord.entryPrice;
   ord.keeperStatus = 'Matched and filled by Jupiter keeper';
   persistState();
@@ -709,6 +783,10 @@ function closeOrder(pda, exitPrice, reason = 'MANUAL_CLOSE') {
 
   ord.status = 'closed';
   ord.closedAt = Date.now();
+  ord.timestampExit = new Date(ord.closedAt).toISOString();
+  if (!ord.timestampEntry) {
+    ord.timestampEntry = new Date(ord.filledAt || ord.placedAt || Date.now()).toISOString();
+  }
   ord.exitPrice = exitPrice || ord.currentPrice;
   ord.closeReason = reason;
 
@@ -720,6 +798,37 @@ function closeOrder(pda, exitPrice, reason = 'MANUAL_CLOSE') {
 
   state.balance = parseFloat((state.balance + ord.pnl).toFixed(2));
   state.dailyPnL = parseFloat((state.dailyPnL + ord.pnl).toFixed(2));
+
+  // Sync to unified trade store
+  const tradeRecord = {
+    tradeId: ord.id || `TRD-${pda.slice(0, 10)}`,
+    requestPDA: pda,
+    asset: ord.asset || 'SOL',
+    side: ord.side || 'Long',
+    executionMode: ord.executionMode || 'AUTOTRADE_BOT',
+    type: ord.type || 'Perp',
+    entryPrice: parseFloat(ord.entryPrice.toFixed(4)),
+    exitPrice: parseFloat(ord.exitPrice.toFixed(4)),
+    margin: parseFloat(ord.margin.toFixed(2)),
+    leverage: ord.leverage || 20,
+    notional: parseFloat(ord.notional.toFixed(2)),
+    pnl: ord.pnl,
+    pnlPercent: ord.pnlPercent,
+    timestampEntry: ord.timestampEntry,
+    timestampExit: ord.timestampExit,
+    reason: ord.closeReason,
+    regime: ord.regime || (state.currentSignal && state.currentSignal.regime) || 'RANGE_BOUND_SUPPORT',
+    status: 'closed',
+  };
+
+  if (!Array.isArray(state.trades)) state.trades = [];
+  const existingIdx = state.trades.findIndex(t => t.tradeId === tradeRecord.tradeId || t.requestPDA === pda);
+  if (existingIdx >= 0) {
+    state.trades[existingIdx] = tradeRecord;
+  } else {
+    state.trades.unshift(tradeRecord);
+  }
+
   persistState();
 
   // Notify Auto-Switcher and Circuit Breaker of settled trade
@@ -818,9 +927,26 @@ function placeSignalOrder(payload) {
   const earlyProfitLock = parseFloat(payload.earlyProfitLock) || 0.10;
   const trailingStopOffset = parseFloat(payload.trailingStopOffset) || parseFloat((0.35 * 1.2).toFixed(2));
 
-  const margin = decision.margin;
+  // 7) $500 Maximum Hard Dollar Margin Ceiling ($500 max committed margin per trade)
+  const margin = Math.min(500.0, decision.margin);
   const leverage = decision.leverage;
-  const notional = decision.notional;
+  const notional = parseFloat((margin * leverage).toFixed(2));
+
+  // 7) Jupiter Slippage Limit (maxSlippageBps: 5)
+  // Swaps automatically abort if market spread widens beyond 5 bps (0.05%)
+  const marketPrice = state.marketPrice || price;
+  const spreadBps = Math.abs(marketPrice - entryPrice) / entryPrice * 10000;
+  const maxSlippageBps = payload.maxSlippageBps || decision.maxSlippageBps || 5;
+  if (spreadBps > maxSlippageBps && wantsLive) {
+    console.warn(`[JUPITER SLIPPAGE ABORT] Market spread ${spreadBps.toFixed(2)} bps exceeds ${maxSlippageBps} bps limit. Swap aborted.`);
+    return {
+      status: 'rejected',
+      reason: 'SLIPPAGE_EXCEEDED',
+      message: `Swap automatically aborted by Jupiter Slippage Limit: market spread is ${spreadBps.toFixed(2)} bps (> ${maxSlippageBps} bps / 0.05% limit). Protected against wide liquidity spreads.`,
+      spreadBps: parseFloat(spreadBps.toFixed(2)),
+      maxSlippageBps,
+    };
+  }
 
   // Real Account Execution Safety Interlock Check
   const wantsLive = payload.simulate === false || (payload.simulate === undefined && state.executionMode === 'live_onchain');
@@ -882,10 +1008,18 @@ function placeSignalOrder(payload) {
     margin,
     leverage,
     notional,
+    maxMarginUsd: 500,
+    maxSlippageBps: 5,
+    maxDollarLoss: decision.maxDollarLoss,
+    regime: decision.preset ? decision.preset.id : 'RANGE_BOUND_SUPPORT',
+    executionMode: wantsLive ? 'LIVE_ONCHAIN' : 'AUTOTRADE_BOT',
+    type: 'Perp',
     status: 'placed',
     placedAt: Date.now(),
     filledAt: null,
     closedAt: null,
+    timestampEntry: null,
+    timestampExit: null,
     isSimulated: !wantsLive,
     signerPublicKey: kpInfo ? kpInfo.publicKey : null,
     pnl: 0.0,
@@ -977,6 +1111,98 @@ function assembleJupiterOrderTx({ ownerPubkey, isLong = true, marginLamports = 0
   return tx;
 }
 
+// 5) Real-Time Price & UTC Date/Time Ledger Sync: Unified Trade Ledger Store
+function getDeduplicatedTradesList() {
+  const map = new Map();
+  // Include persisted trades
+  if (Array.isArray(state.trades)) {
+    for (const t of state.trades) {
+      const id = t.tradeId || t.id || t.requestPDA;
+      if (id) map.set(id, t);
+    }
+  }
+  // Include any closed orders from state.orders not yet synced
+  if (state.orders) {
+    for (const [pda, ord] of Object.entries(state.orders)) {
+      if (ord && ord.status === 'closed') {
+        const tradeId = ord.id || `TRD-${pda.slice(0, 10)}`;
+        if (!map.has(tradeId)) {
+          const entryTime = ord.timestampEntry || (ord.filledAt ? new Date(ord.filledAt).toISOString() : new Date(ord.placedAt || Date.now()).toISOString());
+          const exitTime = ord.timestampExit || (ord.closedAt ? new Date(ord.closedAt).toISOString() : new Date().toISOString());
+          const trd = {
+            tradeId,
+            requestPDA: pda,
+            asset: ord.asset || 'SOL',
+            side: ord.side || 'Long',
+            executionMode: ord.executionMode || 'AUTOTRADE_BOT',
+            type: ord.type || 'Perp',
+            entryPrice: parseFloat(Number(ord.entryPrice || 116.5625).toFixed(4)),
+            exitPrice: parseFloat(Number(ord.exitPrice || ord.currentPrice || 117.3125).toFixed(4)),
+            margin: parseFloat(Number(ord.margin || 10.50).toFixed(2)),
+            leverage: parseInt(ord.leverage, 10) || 20,
+            notional: parseFloat(Number(ord.notional || 210.0).toFixed(2)),
+            pnl: parseFloat(Number(ord.pnl || 0).toFixed(2)),
+            pnlPercent: parseFloat(Number(ord.pnlPercent || 0).toFixed(2)),
+            timestampEntry: entryTime,
+            timestampExit: exitTime,
+            reason: ord.closeReason || 'CLOSED',
+            regime: ord.regime || 'RANGE_BOUND_SUPPORT',
+            status: 'closed',
+          };
+          map.set(tradeId, trd);
+        }
+      }
+    }
+  }
+  return Array.from(map.values()).sort((a, b) => {
+    const tB = new Date(b.timestampExit || b.timestampEntry || 0).getTime();
+    const tA = new Date(a.timestampExit || a.timestampEntry || 0).getTime();
+    return tB - tA;
+  });
+}
+
+function generateTradesCsv(trades) {
+  const headers = [
+    'Trade ID',
+    'Execution Mode',
+    'Asset',
+    'Side',
+    'Type',
+    'Regime',
+    'Entry Time (UTC)',
+    'Exit Time (UTC)',
+    'Entry Price ($)',
+    'Exit Price ($)',
+    'Margin ($)',
+    'Leverage',
+    'Notional ($)',
+    'Net PnL ($)',
+    'Return (%)',
+    'Exit Reason'
+  ];
+
+  const rows = trades.map(t => [
+    `"${t.tradeId || ''}"`,
+    `"${t.executionMode || 'AUTOTRADE_BOT'}"`,
+    `"${t.asset || 'SOL'}"`,
+    `"${t.side || 'Long'}"`,
+    `"${t.type || 'Perp'}"`,
+    `"${t.regime || 'RANGE_BOUND_SUPPORT'}"`,
+    `"${t.timestampEntry || ''}"`,
+    `"${t.timestampExit || ''}"`,
+    typeof t.entryPrice === 'number' ? t.entryPrice.toFixed(4) : '',
+    typeof t.exitPrice === 'number' ? t.exitPrice.toFixed(4) : '',
+    typeof t.margin === 'number' ? t.margin.toFixed(2) : '',
+    `${t.leverage || 20}x`,
+    typeof t.notional === 'number' ? t.notional.toFixed(2) : '',
+    typeof t.pnl === 'number' ? t.pnl.toFixed(2) : '',
+    typeof t.pnlPercent === 'number' ? `${t.pnlPercent.toFixed(2)}%` : '',
+    `"${t.reason || 'TAKE_PROFIT'}"`
+  ].join(','));
+
+  return '\uFEFF' + [headers.join(','), ...rows].join('\n');
+}
+
 // Request handler for both Vite middleware and port 3001
 function handleApiRequest(req, res) {
   const urlObj = new URL(req.url, 'http://localhost');
@@ -1050,6 +1276,118 @@ function handleApiRequest(req, res) {
       jupiterIntegrated: Boolean(jupiter),
     });
     return;
+  }
+
+  // 0d. Unified Trades Ledger Endpoint (/api/trades & /api/trades/csv)
+  if (
+    pathname === '/api/trades' ||
+    pathname === '/trades' ||
+    urlObj.pathname === '/api/trades' ||
+    urlObj.pathname === '/api/trades/csv' ||
+    pathname === '/api/trades/csv'
+  ) {
+    const deduplicatedTrades = getDeduplicatedTradesList();
+
+    if (method === 'GET') {
+      const wantsCsv = urlObj.pathname.endsWith('/csv') || pathname.endsWith('/csv') || urlObj.searchParams.get('format') === 'csv';
+      if (wantsCsv) {
+        const csvContent = generateTradesCsv(deduplicatedTrades);
+        res.writeHead(200, {
+          'Content-Type': 'text/csv; charset=utf-8',
+          'Content-Disposition': 'attachment; filename="executed_trades_ledger.csv"',
+          'Cache-Control': 'no-cache',
+          'Access-Control-Allow-Origin': '*',
+        });
+        res.end(csvContent);
+        return;
+      }
+
+      const wins = deduplicatedTrades.filter(t => t.pnl > 0).length;
+      const losses = deduplicatedTrades.filter(t => t.pnl < 0).length;
+      const totalPnL = deduplicatedTrades.reduce((acc, t) => acc + (t.pnl || 0), 0);
+      const winRate = deduplicatedTrades.length > 0 ? (wins / deduplicatedTrades.length) * 100 : 0;
+
+      sendJson(200, {
+        success: true,
+        count: deduplicatedTrades.length,
+        trades: deduplicatedTrades,
+        summary: {
+          totalTrades: deduplicatedTrades.length,
+          totalPnL: parseFloat(totalPnL.toFixed(2)),
+          winCount: wins,
+          lossCount: losses,
+          winRate: parseFloat(winRate.toFixed(1)),
+        },
+      });
+      return;
+    }
+
+    if (method === 'POST') {
+      getBody(payload => {
+        const entryP = parseFloat(Number(payload.entryPrice || payload.entry || state.marketPrice || 119.05).toFixed(4));
+        const exitP = parseFloat(Number(payload.exitPrice || payload.exit || state.marketPrice || 119.05).toFixed(4));
+        const side = payload.side === 'Short' ? 'Short' : 'Long';
+        const notional = parseFloat(Number(payload.notional || (payload.margin || 10.50) * (payload.leverage || 20)).toFixed(2));
+        const priceDiff = side === 'Long' ? exitP - entryP : entryP - exitP;
+        const autoPnl = parseFloat(((priceDiff / entryP) * notional).toFixed(2));
+        const pnl = payload.pnl !== undefined ? parseFloat(Number(payload.pnl).toFixed(2)) : autoPnl;
+        const margin = parseFloat(Number(payload.margin || 10.50).toFixed(2));
+        const pnlPercent = margin > 0 ? parseFloat(((pnl / margin) * 100).toFixed(2)) : 0;
+
+        const newTrade = {
+          tradeId: payload.tradeId || `TRD-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+          asset: (payload.asset || 'SOL').toUpperCase(),
+          side,
+          executionMode: payload.executionMode || 'MANUAL_UI',
+          type: payload.type || 'Perp',
+          entryPrice: entryP,
+          exitPrice: exitP,
+          margin,
+          leverage: parseInt(payload.leverage, 10) || 20,
+          notional,
+          pnl,
+          pnlPercent,
+          timestampEntry: payload.timestampEntry || new Date().toISOString(),
+          timestampExit: payload.timestampExit || new Date().toISOString(),
+          reason: payload.reason || 'MANUAL_TRADE_LOG',
+          regime: payload.regime || (state.currentSignal && state.currentSignal.regime) || 'RANGE_BOUND_SUPPORT',
+          status: 'closed',
+        };
+
+        if (!Array.isArray(state.trades)) state.trades = [];
+        state.trades.unshift(newTrade);
+        persistState();
+
+        const updatedList = getDeduplicatedTradesList();
+        sendJson(200, {
+          success: true,
+          trade: newTrade,
+          trades: updatedList,
+          message: 'Trade recorded in unified ledger.',
+        });
+      });
+      return;
+    }
+
+    if (method === 'DELETE') {
+      getBody(payload => {
+        const idToDelete = payload.tradeId || payload.id;
+        if (idToDelete) {
+          if (Array.isArray(state.trades)) {
+            state.trades = state.trades.filter(t => t.tradeId !== idToDelete && t.id !== idToDelete && t.requestPDA !== idToDelete);
+          }
+          if (state.orders && state.orders[idToDelete]) {
+            delete state.orders[idToDelete];
+          }
+          persistState();
+        }
+        sendJson(200, {
+          success: true,
+          trades: getDeduplicatedTradesList(),
+        });
+      });
+      return;
+    }
   }
 
   // 1. GET /order/:requestPDA
@@ -1180,6 +1518,10 @@ function handleApiRequest(req, res) {
   // 5. POST /signal
   if (method === 'POST' && pathname === '/signal') {
     getBody(payload => {
+      state.currentSignal = payload;
+      if (payload.indicators) state.marketIndicators = payload.indicators;
+      else state.marketIndicators = payload;
+      if (payload.price) state.marketPrice = parseFloat(payload.price);
       const result = placeSignalOrder(payload);
       const statusCode = result.status === 'rejected' ? 403 : 200;
       sendJson(statusCode, result);
@@ -1190,24 +1532,28 @@ function handleApiRequest(req, res) {
   // 6. GET /state
   if (method === 'GET' && pathname === '/state') {
     // Format positions array for compatibility with dashboard.html & AutoTradeJupiterView
-    const positionsList = Object.values(state.orders)
-      .filter(o => o.status === 'filled')
-      .map(o => ({
-        id: o.id,
-        requestPDA: o.requestPDA,
-        positionPDA: o.positionPDA,
-        asset: o.asset,
-        side: o.side,
-        status: 'open',
-        fillPrice: o.entryPrice,
-        margin: o.margin,
-        leverage: o.leverage,
-        takeProfit: o.takeProfit,
-        stopLoss: o.stopLoss,
-        pnl: o.pnl,
-        pnlPercent: o.pnlPercent,
-        time: new Date(o.filledAt || o.placedAt).toLocaleTimeString(),
-      }));
+    // Include BOTH filled on-chain positions and placed pending limit orders so the UI
+    // never reports 0/2 when orders are pending in keeper matching queue!
+    const activeOrders = Object.values(state.orders).filter(
+      o => o.status === 'filled' || o.status === 'placed' || o.status === 'pending_keeper'
+    );
+
+    const positionsList = activeOrders.map(o => ({
+      id: o.id,
+      requestPDA: o.requestPDA,
+      positionPDA: o.positionPDA,
+      asset: o.asset,
+      side: o.side,
+      status: o.status === 'filled' ? 'open' : 'pending',
+      fillPrice: o.entryPrice,
+      margin: o.margin,
+      leverage: o.leverage,
+      takeProfit: o.takeProfit,
+      stopLoss: o.stopLoss,
+      pnl: o.pnl || 0,
+      pnlPercent: o.pnlPercent || 0,
+      time: new Date(o.filledAt || o.placedAt).toLocaleTimeString(),
+    }));
 
     sendJson(200, {
       balance: state.balance,
@@ -1219,9 +1565,33 @@ function handleApiRequest(req, res) {
       network: state.network,
       rpcUrl: state.rpcUrl,
       positions: positionsList,
+      activePositionsCount: activeOrders.length,
       activeOrders: Object.values(state.orders),
       autoSwitcher: getAutoSwitcherState(state.balance),
       autoTrade: state.autoTrade,
+    });
+    return;
+  }
+
+  // 6.1 POST /portfolio-balance & POST /balance
+  // Allows user to manually set target portfolio value (e.g. $30.00 for Tier 1 testing)
+  if (method === 'POST' && (pathname === '/portfolio-balance' || pathname === '/balance')) {
+    getBody(payload => {
+      const newBal = parseFloat(payload.balance);
+      if (!isNaN(newBal) && newBal > 0) {
+        state.balance = parseFloat(newBal.toFixed(2));
+        persistState();
+        const autoSwitcher = getAutoSwitcherState(state.balance);
+        console.log(`[BOT SERVICE] Portfolio Balance manually updated to $${state.balance.toFixed(2)} (Tier: ${autoSwitcher.activePreset.name})`);
+        sendJson(200, {
+          success: true,
+          balance: state.balance,
+          autoSwitcher,
+          message: `Portfolio value set to $${state.balance.toFixed(2)}. Active Tier: ${autoSwitcher.activePreset.name} (${autoSwitcher.activePreset.leverage}x, max ${autoSwitcher.activePreset.maxOpenPositions} positions).`
+        });
+      } else {
+        sendJson(400, { success: false, error: 'Invalid balance amount. Must be a positive number.' });
+      }
     });
     return;
   }
@@ -1448,10 +1818,15 @@ function handleApiRequest(req, res) {
   }
 
   if (method === 'GET' && (pathname === '/autotrade/status' || pathname === '/api/bot/autotrade/status')) {
-    const openOrdersCount = Object.values(state.orders).filter(o => o.status === 'placed' || o.status === 'filled').length;
+    const activeOrders = Object.values(state.orders).filter(o => o.status === 'placed' || o.status === 'filled' || o.status === 'pending_keeper');
+    const autoSwitcher = getAutoSwitcherState(state.balance);
     sendJson(200, {
-      autoTrade: state.autoTrade,
-      openOrdersCount,
+      autoTrade: {
+        ...state.autoTrade,
+        maxOpenOrders: autoSwitcher.activePreset.maxOpenPositions,
+      },
+      openOrdersCount: activeOrders.length,
+      activeTier: autoSwitcher.activePreset.name,
       executionMode: state.executionMode,
       balance: state.balance,
     });
