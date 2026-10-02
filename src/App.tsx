@@ -47,6 +47,70 @@ export default function App() {
   const [selectedRegime, setSelectedRegime] = useState<string>('COMBINED');
   const [isMonteCarloOpen, setIsMonteCarloOpen] = useState(false);
 
+  // Global Real-Time Bot State (Portfolio Balance & Open Positions Responsiveness)
+  const [portfolioBalance, setPortfolioBalance] = useState<number>(30.0);
+  const [openPositionsCount, setOpenPositionsCount] = useState<number>(0);
+  const [maxOpenPositions, setMaxOpenPositions] = useState<number>(1);
+  const [activeTierName, setActiveTierName] = useState<string>('Peak Win Rate (20x LSD)');
+
+  const syncBotState = useCallback(async () => {
+    try {
+      const res = await fetch('/state', { cache: 'no-store' });
+      if (res.ok) {
+        const data = await res.json();
+        if (typeof data.balance === 'number') {
+          setPortfolioBalance(data.balance);
+        }
+        if (Array.isArray(data.positions)) {
+          // Count active filled or pending limit orders
+          const activeCount = data.positions.filter(
+            (p: any) => p.status === 'open' || p.status === 'filled' || p.status === 'pending'
+          ).length;
+          setOpenPositionsCount(activeCount);
+        }
+        if (data.autoSwitcher?.activePreset) {
+          setMaxOpenPositions(data.autoSwitcher.activePreset.maxOpenPositions ?? 1);
+          setActiveTierName(data.autoSwitcher.activePreset.name || 'Tier 1');
+        }
+      }
+    } catch (_) {}
+  }, []);
+
+  useEffect(() => {
+    syncBotState();
+    // Fast 1.5s responsive polling
+    const interval = setInterval(syncBotState, 1500);
+
+    const onBotUpdate = () => syncBotState();
+    window.addEventListener('BOT_STATE_UPDATED', onBotUpdate);
+    window.addEventListener('focus', onBotUpdate);
+
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener('BOT_STATE_UPDATED', onBotUpdate);
+      window.removeEventListener('focus', onBotUpdate);
+    };
+  }, [syncBotState]);
+
+  const handleUpdatePortfolioBalance = async (newBal: number) => {
+    setPortfolioBalance(newBal);
+    try {
+      const res = await fetch('/portfolio-balance', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ balance: newBal }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.autoSwitcher?.activePreset) {
+          setMaxOpenPositions(data.autoSwitcher.activePreset.maxOpenPositions ?? 1);
+          setActiveTierName(data.autoSwitcher.activePreset.name);
+        }
+      }
+      window.dispatchEvent(new CustomEvent('BOT_STATE_UPDATED'));
+    } catch (_) {}
+  };
+
   // Live ticker polling with multi-exchange fallback (Binance Proxy -> Binance Vision -> Coinbase -> Kraken)
   useEffect(() => {
     let isMounted = true;
@@ -194,6 +258,11 @@ export default function App() {
           onOpenMonteCarlo={() => setIsMonteCarloOpen(true)}
           onResetDefaults={handleResetDefaults}
           hasTrades={Boolean(combinedResult && combinedResult.trades.length > 0)}
+          portfolioBalance={portfolioBalance}
+          onUpdatePortfolioBalance={handleUpdatePortfolioBalance}
+          openPositionsCount={openPositionsCount}
+          maxOpenPositions={maxOpenPositions}
+          activeTierName={activeTierName}
           onExportCSV={() => {
             if (combinedResult) {
               exportAllResultsToCSV(isolatedResults, combinedResult);
@@ -212,6 +281,10 @@ export default function App() {
               onSetUpdateIntervalSecs={setUpdateIntervalSecs}
               onSwitchToAutoTrade={() => setActiveWindow('AUTOTRADE')}
               onSwitchToBacktest={() => setActiveWindow('BACKTEST')}
+              portfolioBalance={portfolioBalance}
+              onUpdatePortfolioBalance={handleUpdatePortfolioBalance}
+              openPositionsCount={openPositionsCount}
+              maxOpenPositions={maxOpenPositions}
             />
           </div>
         )}
@@ -225,6 +298,8 @@ export default function App() {
               onSwitchToLive={() => setActiveWindow('LIVE_VIEW')}
               solPrice={solPrice}
               priceChange={priceChange}
+              portfolioBalance={portfolioBalance}
+              onUpdatePortfolioBalance={handleUpdatePortfolioBalance}
             />
           </div>
         )}
