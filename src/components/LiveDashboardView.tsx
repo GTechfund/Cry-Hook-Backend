@@ -1,11 +1,9 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { 
-  ShieldCheck, 
   TrendingUp, 
-  TrendingDown, 
-  Activity, 
-  Zap, 
-  Cpu 
+  TrendingDown,
+  Layers,
+  Wallet
 } from 'lucide-react';
 import { 
   calcCCI, 
@@ -21,6 +19,39 @@ import {
   detectBullDiv,
   calcSignalEngine
 } from '../engine/indicators.ts';
+import { LiveIndicatorCharts, CandleChartBar } from './LiveIndicatorCharts.tsx';
+import { DashboardCalculator } from './DashboardCalculator.tsx';
+
+function generateInitialCandles(basePrice = 119.05): CandleChartBar[] {
+  const bars: CandleChartBar[] = [];
+  const now = Date.now();
+  let price = basePrice - 1.2;
+  for (let i = 65; i >= 0; i--) {
+    const time = now - i * 15 * 60 * 1000;
+    const delta = Math.sin(i * 0.22) * 0.35 + ((i % 3 === 0 ? 0.2 : -0.15) * Math.random());
+    const open = price;
+    const close = price + delta;
+    const high = Math.max(open, close) + 0.15 + Math.random() * 0.15;
+    const low = Math.min(open, close) - 0.15 - Math.random() * 0.15;
+    price = close;
+    bars.push({
+      time,
+      open,
+      high,
+      low,
+      close,
+      volume: 12000 + Math.floor(Math.random() * 18000),
+      tenkan: (high + low) / 2,
+      vwma: close * 0.9985,
+      sma50: close * 0.996,
+      cci: Math.sin(i * 0.18) * 140,
+      fisher: Math.sin(i * 0.14) * 3.5 + 3.0,
+      fisherSignal: Math.sin((i - 1) * 0.14) * 3.5 + 3.0,
+      atr: 0.42 + Math.random() * 0.15,
+    });
+  }
+  return bars;
+}
 
 interface LiveDashboardViewProps {
   currentAsset: string;
@@ -30,6 +61,10 @@ interface LiveDashboardViewProps {
   solPrice?: number;
   updateIntervalSecs?: number;
   onSetUpdateIntervalSecs?: (secs: number) => void;
+  portfolioBalance?: number;
+  onUpdatePortfolioBalance?: (newBal: number) => void;
+  openPositionsCount?: number;
+  maxOpenPositions?: number;
 }
 
 interface IndicatorsState {
@@ -149,6 +184,10 @@ export const LiveDashboardView: React.FC<LiveDashboardViewProps> = ({
   solPrice: _solPrice,
   updateIntervalSecs = 5,
   onSetUpdateIntervalSecs: _onSetUpdateIntervalSecs,
+  portfolioBalance: propPortfolioBalance = 30.0,
+  onUpdatePortfolioBalance: propOnUpdatePortfolioBalance,
+  openPositionsCount = 0,
+  maxOpenPositions = 1,
 }) => {
   const [binanceStatus, setBinanceStatus] = useState<{ connected: boolean; latencyMs: number | null }>({
     connected: true,
@@ -158,11 +197,36 @@ export const LiveDashboardView: React.FC<LiveDashboardViewProps> = ({
   const [isLiveSynced, setIsLiveSynced] = useState<boolean>(false);
   const [autoTradeActive, setAutoTradeActive] = useState<boolean>(true);
   const [autoTradeToast, setAutoTradeToast] = useState<string | null>(null);
+  const [chartCandles, setChartCandles] = useState<CandleChartBar[]>(() => generateInitialCandles(_solPrice || 119.05));
+  const [chartTimeframe, setChartTimeframe] = useState<string>('15m');
+  const [portfolioBalance, setPortfolioBalance] = useState<number>(propPortfolioBalance || 30.0);
   const lastAutoTradeTimeRef = useRef<number>(0);
   const [, setLastUpdated] = useState<string>('Syncing live telemetry...');
 
+  useEffect(() => {
+    if (typeof propPortfolioBalance === 'number') {
+      setPortfolioBalance(propPortfolioBalance);
+    }
+  }, [propPortfolioBalance]);
+
+  const handleUpdatePortfolioBalance = async (newBal: number) => {
+    setPortfolioBalance(newBal);
+    if (propOnUpdatePortfolioBalance) {
+      propOnUpdatePortfolioBalance(newBal);
+    } else {
+      try {
+        await fetch('/portfolio-balance', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ balance: newBal }),
+        });
+        window.dispatchEvent(new CustomEvent('BOT_STATE_UPDATED'));
+      } catch (_) {}
+    }
+  };
+
   // Compute live indicators from raw Binance candles
-  const calculateTelemetry = useCallback((raw: any[], rawHtf: any[], raw5m: any[], asset: string) => {
+  const calculateTelemetry = useCallback((raw: any[], rawHtf: any[], raw5m: any[], asset: string, rawChartTf?: any[]) => {
     try {
       if (!raw || !Array.isArray(raw) || raw.length < 20) return;
 
@@ -305,11 +369,21 @@ export const LiveDashboardView: React.FC<LiveDashboardViewProps> = ({
         prevADX,
       );
 
+      // 6) Ultra-Low ADX Filter (ADX < 12 & Vol > 35K -> Forced Yellow Standby / 0x Leverage Sit-Out)
+      if (curADX < 12 && (lastVol > 35000 || volOK)) {
+        sigRes.signal = 'yellow';
+        sigRes.regime = 'MARKET_CHOP';
+        sigRes.recommendedMargin = 0;
+      }
+
       const entryPrice = sigRes.signal === 'green' ? curPrice - sigRes.entryOffset : curPrice + sigRes.entryOffset;
 
       let confidence: 'HIGH CONFIDENCE' | 'MEDIUM CONFIDENCE' | 'LOW CONFIDENCE' = 'MEDIUM CONFIDENCE';
       let confidenceSub = '1H HTF is Neutral (Consolidation)';
-      if (htfSignal === 'green') {
+      if (curADX < 12 && (lastVol > 35000 || volOK)) {
+        confidence = 'LOW CONFIDENCE';
+        confidenceSub = `ADX (14) = ${curADX.toFixed(1)} < 12 with Volume > 35K: Ultra-Low ADX Chop Sit-Out`;
+      } else if (htfSignal === 'green') {
         confidence = 'HIGH CONFIDENCE';
         confidenceSub = '1H HTF Bullish Alignment';
       } else if (htfSignal === 'red') {
@@ -335,7 +409,7 @@ export const LiveDashboardView: React.FC<LiveDashboardViewProps> = ({
         atr: curATR,
         atrOK,
         adx: curADX,
-        adxStatus,
+        adxStatus: curADX < 12 ? 'Ultra-Low (<12)' : adxStatus,
         adxOK,
         sessionName,
         sessionOK,
@@ -370,6 +444,42 @@ export const LiveDashboardView: React.FC<LiveDashboardViewProps> = ({
         confidenceSub,
       });
 
+      // Map candles and indicator series to chart bars (aligned with chartTimeframe)
+      const cSource = rawChartTf && Array.isArray(rawChartTf) && rawChartTf.length >= 20 ? rawChartTf : raw;
+      const cOpens = cSource.map((k) => parseFloat(k[1]));
+      const cHighs = cSource.map((k) => parseFloat(k[2]));
+      const cLows = cSource.map((k) => parseFloat(k[3]));
+      const cCloses = cSource.map((k) => parseFloat(k[4]));
+      const cVols = cSource.map((k) => parseFloat(k[5]));
+
+      const cTenkan = calcTenkan(cHighs.slice(0, -1), cLows.slice(0, -1), 9);
+      const cVwma = calcVWMA(cCloses.slice(0, -1), cVols.slice(0, -1), 20);
+      const cSma50 = calcSMA(cCloses.slice(0, -1), 50);
+      const cCci = calcCCI(cHighs.slice(0, -1), cLows.slice(0, -1), cCloses.slice(0, -1), 20);
+      const cFisher = calcFisher(cHighs.slice(0, -1), cLows.slice(0, -1), 9);
+      const cFishSig = calcFisherSignal(cFisher);
+      const cAtr = calcATR(cHighs.slice(0, -1), cLows.slice(0, -1), cCloses.slice(0, -1), 14);
+
+      const fullCandles: CandleChartBar[] = cOpens.map((op, i) => {
+        const barTime = cSource[i] && cSource[i][0] ? Number(cSource[i][0]) : Date.now() - (cOpens.length - 1 - i) * 15 * 60 * 1000;
+        return {
+          time: barTime,
+          open: op,
+          high: cHighs[i],
+          low: cLows[i],
+          close: cCloses[i],
+          volume: cVols[i],
+          tenkan: cTenkan[i] ?? null,
+          vwma: cVwma[i] ?? null,
+          sma50: cSma50[i] ?? null,
+          cci: cCci[i] ?? null,
+          fisher: cFisher[i] ?? null,
+          fisherSignal: cFishSig[i] ?? null,
+          atr: cAtr[i] ?? null,
+        };
+      });
+      setChartCandles(fullCandles);
+
       setIsLiveSynced(true);
       setLastUpdated(new Date().toLocaleTimeString());
     } catch (err) {
@@ -384,6 +494,7 @@ export const LiveDashboardView: React.FC<LiveDashboardViewProps> = ({
     let raw15m: any[] | null = null;
     let raw1h: any[] = [];
     let raw5m: any[] = [];
+    let rawChartTf: any[] | null = null;
 
     // Attempt 1: Local server proxy (/api/binance/klines)
     try {
@@ -392,12 +503,16 @@ export const LiveDashboardView: React.FC<LiveDashboardViewProps> = ({
         const parsed = await res15m.json();
         if (Array.isArray(parsed) && parsed.length > 5) {
           raw15m = parsed;
-          const [res1h, res5m] = await Promise.all([
+          const [res1h, res5m, resChart] = await Promise.all([
             fetch(`/api/binance/klines?symbol=${encodeURIComponent(symbol)}&interval=1h&limit=100`).catch(() => null),
             fetch(`/api/binance/klines?symbol=${encodeURIComponent(symbol)}&interval=5m&limit=100`).catch(() => null),
+            chartTimeframe !== '15m'
+              ? fetch(`/api/binance/klines?symbol=${encodeURIComponent(symbol)}&interval=${chartTimeframe}&limit=200`).catch(() => null)
+              : null,
           ]);
           if (res1h && res1h.ok) raw1h = await res1h.json();
           if (res5m && res5m.ok) raw5m = await res5m.json();
+          if (resChart && resChart.ok) rawChartTf = await resChart.json();
         }
       }
     } catch (_) {
@@ -412,12 +527,16 @@ export const LiveDashboardView: React.FC<LiveDashboardViewProps> = ({
           const parsed = await res15m.json();
           if (Array.isArray(parsed) && parsed.length > 5) {
             raw15m = parsed;
-            const [res1h, res5m] = await Promise.all([
+            const [res1h, res5m, resChart] = await Promise.all([
               fetch(`https://data-api.binance.vision/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=1h&limit=100`).catch(() => null),
               fetch(`https://data-api.binance.vision/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=5m&limit=100`).catch(() => null),
+              chartTimeframe !== '15m'
+                ? fetch(`https://data-api.binance.vision/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${chartTimeframe}&limit=200`).catch(() => null)
+                : null,
             ]);
             if (res1h && res1h.ok) raw1h = await res1h.json();
             if (res5m && res5m.ok) raw5m = await res5m.json();
+            if (resChart && resChart.ok) rawChartTf = await resChart.json();
           }
         }
       } catch (_) {
@@ -427,11 +546,11 @@ export const LiveDashboardView: React.FC<LiveDashboardViewProps> = ({
 
     if (raw15m && Array.isArray(raw15m) && raw15m.length > 5) {
       setBinanceStatus({ connected: true, latencyMs: Date.now() - start });
-      calculateTelemetry(raw15m, raw1h, raw5m, currentAsset);
+      calculateTelemetry(raw15m, raw1h, raw5m, currentAsset, rawChartTf || raw15m);
     } else {
       setBinanceStatus({ connected: false, latencyMs: null });
     }
-  }, [currentAsset, calculateTelemetry]);
+  }, [currentAsset, calculateTelemetry, chartTimeframe]);
 
   useEffect(() => {
     fetchTelemetry();
@@ -550,6 +669,7 @@ export const LiveDashboardView: React.FC<LiveDashboardViewProps> = ({
         } else if (data.status === 'rejected') {
           setAutoTradeToast(`⚠️ Auto-Trade Skipped: ${data.reason || data.message}`);
         }
+        window.dispatchEvent(new CustomEvent('BOT_STATE_UPDATED'));
       })
       .catch((err) => {
         console.warn('[AUTOTRADE DISPATCH ERROR]:', err.message);
@@ -692,290 +812,62 @@ export const LiveDashboardView: React.FC<LiveDashboardViewProps> = ({
         </div>
       )}
 
-      {/* 3. The Optimized DB Rules Key Banner */}
-      <div className="bg-[#1c1c1a] border border-white/10 rounded-lg p-3 text-xs leading-relaxed font-mono shadow-sm">
-        <div className="flex items-start gap-2">
-          <Activity className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
-          <div className="space-y-1">
-            <div>
-              <span className="text-emerald-400 font-bold mr-1.5">[OPTIMIZED DB RULES ACTIVE]</span>
-              <span><b>Fee-Neutral TP1 widened to $0.35</b> (+3.5%–4.5% net margin yield). Base Stop Loss tightened to <b>1.5× ATR</b> to cut tail drawdown.</span>
-            </div>
-            <div>
-              <span className="text-amber-400 font-bold mr-1.5">[DYNAMIC LIMIT PULLBACKS]</span>
-              <span>Orders auto-fill on limit dips at <b>0.25 × ATR (5¢–20¢)</b> below close, capturing maximum wick edge.</span>
-            </div>
-            <div>
-              <span className="text-rose-400 font-bold mr-1.5">[SYMMETRICAL SIT-OUTS]</span>
-              <span>100% Cash standby during Market Chop (&lt;0.3% of VWMA) and Flash Cascades (ADX &gt; 35 &amp; 1H Red HTF) to eliminate negative-EV trades.</span>
+      {/* Real-Time Autotrade Open Positions & Portfolio Equity Controller */}
+      <div className="bg-[#1c1c1a] border border-white/10 rounded-xl p-3.5 flex flex-wrap items-center justify-between gap-3 text-xs shadow-md">
+        <div className="flex items-center gap-3 flex-wrap">
+          {/* Open Positions Monitor */}
+          <div className="flex items-center gap-2 bg-[#252523] border border-white/10 rounded-lg px-3 py-1.5 font-mono">
+            <Layers className="w-4 h-4 text-blue-400" />
+            <span className="text-neutral-400">Open Positions:</span>
+            <span
+              className={`font-black text-sm px-2 py-0.5 rounded ${
+                openPositionsCount > 0 ? 'bg-amber-500/20 text-amber-300' : 'bg-emerald-500/20 text-emerald-300'
+              }`}
+            >
+              {openPositionsCount} / {maxOpenPositions}
+            </span>
+            <span className="text-[10px] text-neutral-400">
+              ({openPositionsCount >= maxOpenPositions ? 'Cap Reached — Standby' : 'Slots Available'})
+            </span>
+          </div>
+
+          {/* Portfolio Equity Selector */}
+          <div className="flex items-center gap-2 bg-[#252523] border border-white/10 rounded-lg px-3 py-1.5 font-mono">
+            <Wallet className="w-4 h-4 text-emerald-400" />
+            <span className="text-neutral-400">Trading Equity:</span>
+            <span className="text-white font-bold text-sm">${(portfolioBalance || 30).toFixed(2)}</span>
+            <div className="flex items-center gap-1 ml-1">
+              {[30, 50, 100, 240].map((amt) => (
+                <button
+                  key={amt}
+                  onClick={() => handleUpdatePortfolioBalance(amt)}
+                  className={`px-1.5 py-0.5 rounded text-[10px] font-bold transition-all cursor-pointer ${
+                    Math.round(portfolioBalance) === amt
+                      ? 'bg-emerald-500 text-black shadow-sm font-black'
+                      : 'bg-neutral-800 text-neutral-400 hover:text-white'
+                  }`}
+                  title={`Set Portfolio to $${amt}`}
+                >
+                  ${amt}
+                </button>
+              ))}
             </div>
           </div>
+        </div>
+
+        {/* Active Strategy Tier & Risk Summary */}
+        <div className="flex items-center gap-2 font-mono text-[11px] text-neutral-400 flex-wrap">
+          <span className="px-2 py-1 rounded bg-purple-950/40 text-purple-300 border border-purple-500/30 font-bold">
+            {portfolioBalance < 100 ? 'TIER 1: 20x LSD (Micro Scalp)' : portfolioBalance < 250 ? 'TIER 2: 35x HYBRID' : 'TIER 3: 50x ALPHA'}
+          </span>
+          <span>Risk Cap: <b className="text-white">10% (${((portfolioBalance || 30) * 0.10).toFixed(2)})</b></span>
+          <span className="text-white/20">|</span>
+          <span>TP1: <b className="text-emerald-400">+{portfolioBalance < 100 ? '18¢' : '35¢'}</b></span>
+          <span>TP2: <b className="text-emerald-400">+{portfolioBalance < 100 ? '32¢' : '70¢'}</b></span>
         </div>
       </div>
 
-      {/* 3.1 Mainnet Execution Pipeline & Priority Fees Banner */}
-      <div className="bg-[#15171a] border border-blue-500/30 rounded-lg p-3 text-xs leading-relaxed font-mono shadow-sm">
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
-          <div className="flex items-start gap-2.5">
-            <Cpu className="w-4 h-4 text-blue-400 shrink-0 mt-0.5" />
-            <div className="space-y-1">
-              <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-blue-400 font-bold">[MAINNET EXECUTION PIPELINE]</span>
-                <span className="bg-blue-500/20 text-blue-300 border border-blue-500/40 px-2 py-0.5 rounded text-[10px] font-bold">
-                  INTERNAL TRANSACTION ENGINE ACTIVE
-                </span>
-                <span className="text-neutral-400 text-[11px]">server.js / bot-service.cjs · assembleJupiterOrderTx</span>
-              </div>
-              <div className="text-neutral-300 text-[11px] leading-normal">
-                <span className="text-emerald-400 font-semibold mr-1">Compute Priority Fees:</span>
-                <b>250,000 µLamports</b> unit price (<b>400,000 CU limit</b>) attached to guarantee inclusion during Solana volatility.
-              </div>
-              <div className="text-neutral-300 text-[11px] leading-normal">
-                <span className="text-purple-400 font-semibold mr-1">WSOL Wrapping Logic:</span>
-                Automatic native SOL ➔ WSOL (<span className="text-purple-300 font-mono text-[10px]">So11111111111111111111111111111111111111112</span>) token wrapping prior to Jupiter trade submission.
-              </div>
-            </div>
-          </div>
-          <div className="flex items-center gap-2 shrink-0 self-end md:self-center">
-            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 text-[10px] font-bold">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-              PRIORITY INCLUSION READY
-            </span>
-          </div>
-        </div>
-      </div>
-
-      {/* 3.2 TRADE LOGIC IMPROVEMENTS A - F MASTER MATRIX */}
-      <div className="bg-[#141516] border border-purple-500/30 rounded-xl p-4 shadow-xl space-y-3 font-sans">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-white/10 pb-2.5">
-          <div className="flex items-center gap-2">
-            <span className="p-1 rounded-lg bg-purple-500/20 text-purple-300 border border-purple-500/40">
-              <Zap className="w-4 h-4 text-purple-400" />
-            </span>
-            <div>
-              <div className="flex items-center gap-2">
-                <span className="font-bold text-sm text-white tracking-wide">
-                  TRADE LOGIC IMPROVEMENTS MATRIX (A — F)
-                </span>
-                <span className="bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-[10px] font-bold px-2 py-0.5 rounded-full">
-                  100% ACTIVE &amp; ENFORCED
-                </span>
-              </div>
-              <p className="text-[11px] text-neutral-400">
-                Calibrated execution rules maximizing risk-adjusted yield, limiting tail drawdown, and eliminating stale toxic fills.
-              </p>
-            </div>
-          </div>
-          <div className="flex items-center gap-2 text-xs font-mono">
-            <span className="text-neutral-400 text-[11px]">Current Setup:</span>
-            <span className={`px-2 py-0.5 rounded text-[11px] font-bold ${indicators.setupGrade === 'GRADE_A' ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40' : 'bg-amber-500/20 text-amber-300 border border-amber-500/40'}`}>
-              {indicators.setupGrade === 'GRADE_A' ? '★ GRADE A (Confluence)' : 'GRADE B (Standard)'}
-            </span>
-          </div>
-        </div>
-
-        {/* 6 Improvement Cards Grid */}
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2.5 text-xs">
-          {/* Improvement A */}
-          <div className="bg-neutral-900/90 border border-white/10 hover:border-white/20 rounded-xl p-3 space-y-1.5 transition-all">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-1.5 font-bold text-purple-300">
-                <span className="px-1.5 py-0.2 bg-purple-500/20 rounded text-[10px] border border-purple-500/40 font-mono">RULE A</span>
-                <span>15m Limit Order TTL</span>
-              </div>
-              <span className="text-[10px] font-mono text-emerald-400 bg-emerald-500/10 px-1.5 py-0.2 rounded border border-emerald-500/20">
-                TTL: 15 MIN
-              </span>
-            </div>
-            <p className="text-[11px] text-neutral-300 leading-snug">
-              Auto-cancels unexecuted limit orders after 15 minutes (1 bar) to prevent toxic fills when the market drifts away.
-            </p>
-            <div className="text-[10px] font-mono text-neutral-400 flex items-center justify-between pt-1 border-t border-white/5">
-              <span>TTL Window: 1 Bar</span>
-              <span className="text-emerald-400 font-bold">Auto-Cancel On</span>
-            </div>
-          </div>
-
-          {/* Improvement B */}
-          <div className="bg-neutral-900/90 border border-white/10 hover:border-white/20 rounded-xl p-3 space-y-1.5 transition-all">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-1.5 font-bold text-blue-300">
-                <span className="px-1.5 py-0.2 bg-blue-500/20 rounded text-[10px] border border-blue-500/40 font-mono">RULE B</span>
-                <span>Asymmetric HTF Sizing &amp; Targets</span>
-              </div>
-              <span className="text-[10px] font-mono text-blue-400 bg-blue-500/10 px-1.5 py-0.2 rounded border border-blue-500/20">
-                {indicators.htfSignal === 'green' ? '40% / 60%' : indicators.htfSignal === 'red' ? '70% / 30%' : '50% / 50%'}
-              </span>
-            </div>
-            <p className="text-[11px] text-neutral-300 leading-snug">
-              {indicators.htfSignal === 'green'
-                ? '1H Bullish: Bank 40% at TP1 ($0.35), 60% runner to extended TP2 ($0.85–$1.20) with full $120 margin.'
-                : indicators.htfSignal === 'red'
-                ? '1H Bearish: Take 70% off quickly at TP1 ($0.35) against 1H VWMA ceiling; 30% runner, scaled margin ($70–$90).'
-                : '1H Neutral: 50% TP1 ($0.35) / 50% TP2 ($0.55) standard allocation.'}
-            </p>
-            <div className="text-[10px] font-mono text-neutral-400 flex items-center justify-between pt-1 border-t border-white/5">
-              <span>Margin: ${indicators.recommendedMargin}.00</span>
-              <span className="text-blue-300 font-bold">TP1: {indicators.tp1Percent}% / TP2: {indicators.tp2Percent}%</span>
-            </div>
-          </div>
-
-          {/* Improvement C */}
-          <div className="bg-neutral-900/90 border border-white/10 hover:border-white/20 rounded-xl p-3 space-y-1.5 transition-all">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-1.5 font-bold text-amber-300">
-                <span className="px-1.5 py-0.2 bg-amber-500/20 rounded text-[10px] border border-amber-500/40 font-mono">RULE C</span>
-                <span>Setup Grading Confluence</span>
-              </div>
-              <span className={`text-[10px] font-mono px-1.5 py-0.2 rounded border ${indicators.setupGrade === 'GRADE_A' ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' : 'bg-neutral-800 text-neutral-400 border-white/10'}`}>
-                {indicators.setupGrade}
-              </span>
-            </div>
-            <p className="text-[11px] text-neutral-300 leading-snug">
-              Grade A requires Volume expansion OR Bullish Divergence on CCI/Fisher + CCI Momentum Acceleration for maximum capital allocation.
-            </p>
-            <div className="text-[10px] font-mono text-neutral-400 flex items-center justify-between pt-1 border-t border-white/5">
-              <span>Vol: {indicators.volOK ? 'OK' : 'Low'} · Div: {indicators.divType}</span>
-              <span className="text-amber-400 font-bold">CCI Accel: {indicators.cciAccel ? 'Yes' : 'No'}</span>
-            </div>
-          </div>
-
-          {/* Improvement D */}
-          <div className="bg-neutral-900/90 border border-white/10 hover:border-white/20 rounded-xl p-3 space-y-1.5 transition-all">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-1.5 font-bold text-emerald-300">
-                <span className="px-1.5 py-0.2 bg-emerald-500/20 rounded text-[10px] border border-emerald-500/40 font-mono">RULE D</span>
-                <span>Fee-Neutral +10¢ Lock</span>
-              </div>
-              <span className="text-[10px] font-mono text-emerald-400 bg-emerald-500/10 px-1.5 py-0.2 rounded border border-emerald-500/20">
-                +10¢ RATCHET
-              </span>
-            </div>
-            <p className="text-[11px] text-neutral-300 leading-snug">
-              Immediately ratchets stop loss to Entry + $0.10 upon 5m Fisher bearish cross or +10¢ gain, securing micro-gains and guaranteeing net positive fees before a reversal.
-            </p>
-            <div className="text-[10px] font-mono text-neutral-400 flex items-center justify-between pt-1 border-t border-white/5">
-              <span>5m Fisher Cross: {indicators.fisher5mBearishCross ? 'Active Exit' : 'Clear'}</span>
-              <span className="text-emerald-400 font-bold">Floor: Entry + 10¢</span>
-            </div>
-          </div>
-
-          {/* Improvement E */}
-          <div className="bg-neutral-900/90 border border-white/10 hover:border-white/20 rounded-xl p-3 space-y-1.5 transition-all">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-1.5 font-bold text-rose-300">
-                <span className="px-1.5 py-0.2 bg-rose-500/20 rounded text-[10px] border border-rose-500/40 font-mono">RULE E</span>
-                <span>ADX Slope &amp; Trend Exhaustion</span>
-              </div>
-              <span className={`text-[10px] font-mono px-1.5 py-0.2 rounded border ${indicators.isExhaustionReversal ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' : 'bg-neutral-800 text-neutral-300 border-white/10'}`}>
-                {indicators.adxSlope.toUpperCase()}
-              </span>
-            </div>
-            <p className="text-[11px] text-neutral-300 leading-snug">
-              Differentiates accelerating crash cascades (ADX &gt; 35 rising = Sit Out) from oversold trend exhaustion snapback bounces (ADX &gt; 22 falling = High R:R Entry).
-            </p>
-            <div className="text-[10px] font-mono text-neutral-400 flex items-center justify-between pt-1 border-t border-white/5">
-              <span>ADX: {indicators.adx !== null ? indicators.adx.toFixed(1) : '-'}</span>
-              <span className={indicators.isExhaustionReversal ? 'text-emerald-400 font-bold' : 'text-neutral-400'}>
-                {indicators.isExhaustionReversal ? 'Snapback Bounce Ready' : 'Standard Slope'}
-              </span>
-            </div>
-          </div>
-
-          {/* Improvement F */}
-          <div className="bg-neutral-900/90 border border-white/10 hover:border-white/20 rounded-xl p-3 space-y-1.5 transition-all">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-1.5 font-bold text-amber-300">
-                <span className="px-1.5 py-0.2 bg-amber-500/20 rounded text-[10px] border border-amber-500/40 font-mono">RULE F</span>
-                <span>0.25× ATR Limit Entry &amp; Chandelier Trail</span>
-              </div>
-              <span className="text-[10px] font-mono text-amber-400 bg-amber-500/10 px-1.5 py-0.2 rounded border border-amber-500/20">
-                {Math.round(indicators.entryOffset * 100)}¢ / 1.2× ATR
-              </span>
-            </div>
-            <p className="text-[11px] text-neutral-300 leading-snug">
-              Places limit orders at 0.25× ATR below close (8¢ baseline floor) for zero taker slippage. After TP1, trails stop loss 1.2× ATR below highest high reached.
-            </p>
-            <div className="text-[10px] font-mono text-neutral-400 flex items-center justify-between pt-1 border-t border-white/5">
-              <span>Pullback Limit: ${indicators.entryPrice.toFixed(2)}</span>
-              <span className="text-amber-400 font-bold">Chandelier: -${indicators.trailingStopOffset.toFixed(2)}</span>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {/* 3.3 CAPITAL PRESERVATION & RISK MANAGEMENT CONTROLS */}
-      <div className="bg-[#151618] border border-emerald-500/30 rounded-xl p-3.5 shadow-md font-sans text-xs space-y-3">
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
-          <div className="flex items-center gap-2.5">
-            <ShieldCheck className="w-5 h-5 text-emerald-400 shrink-0" />
-            <div>
-              <div className="flex items-center gap-2 flex-wrap">
-                <span className="font-bold text-white tracking-wide">ACTIVE RISK MANAGEMENT GUARDS</span>
-                <span className="bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 text-[10px] font-bold px-2 py-0.5 rounded">
-                  4 SAFETY INTERLOCKS ACTIVE
-                </span>
-                <span className="bg-amber-500/15 text-amber-300 border border-amber-500/30 text-[10px] font-bold px-2 py-0.5 rounded flex items-center gap-1">
-                  <span>⚡ AUTO-PRESET SWITCHER ENGAGED</span>
-                </span>
-              </div>
-              <div className="text-[11px] text-neutral-400 mt-0.5 flex flex-wrap gap-x-4 gap-y-1">
-                <span>🛡️ <b>10% Hard Equity Cap:</b> Max -$3 loss per $30 equity</span>
-                <span>⏱️ <b>3-Bar Stagnation Exit:</b> Market close if adverse &gt;0.30 ATR</span>
-                <span>⚡ <b>2-Loss Circuit Breaker:</b> 5-bar standby mode</span>
-                <span>🔒 <b>Fee-Neutral Ratchet:</b> Entry + $0.10 micro-lock</span>
-              </div>
-            </div>
-          </div>
-
-          <div className="flex items-center gap-2 self-start md:self-auto">
-            <span className="text-[10px] font-mono px-2 py-1 rounded bg-black/40 border border-white/10 text-neutral-300">
-              Circuit Breaker: <b className="text-emerald-400">ARMED / NORMAL</b>
-            </span>
-          </div>
-        </div>
-
-        {/* Dynamic Auto-Preset Switcher Tier Grid */}
-        <div className="pt-2.5 border-t border-white/5 grid grid-cols-1 sm:grid-cols-3 gap-2 text-[11px] font-mono">
-          <div className="p-2.5 rounded-lg bg-blue-950/20 border border-blue-500/30 flex flex-col justify-between">
-            <div className="flex items-center justify-between">
-              <span className="font-bold text-blue-300">$0.00 – $99.99</span>
-              <span className="px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-300 text-[10px] font-bold">20x LSD</span>
-            </div>
-            <div className="font-sans font-semibold text-neutral-200 mt-1">Peak Win Rate Mode</div>
-            <div className="text-[10px] text-neutral-400 mt-0.5">
-              Risk Cap: 10% ($3.00 max) · Fee Drag &lt;1.6%<br />
-              TP2 Target: +0.55 / +0.85 ATR
-            </div>
-          </div>
-
-          <div className="p-2.5 rounded-lg bg-emerald-950/20 border border-emerald-500/30 flex flex-col justify-between">
-            <div className="flex items-center justify-between">
-              <span className="font-bold text-emerald-300">$100.00 – $249.99</span>
-              <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 text-[10px] font-bold">35x</span>
-            </div>
-            <div className="font-sans font-semibold text-neutral-200 mt-1">Hybrid Scaling Tier</div>
-            <div className="text-[10px] text-neutral-400 mt-0.5">
-              Risk Cap: 10% ($10.00 max) · Extended TP2<br />
-              TP2 Target: +0.70 / +1.00 ATR
-            </div>
-          </div>
-
-          <div className="p-2.5 rounded-lg bg-amber-950/20 border border-amber-500/30 flex flex-col justify-between">
-            <div className="flex items-center justify-between">
-              <span className="font-bold text-amber-300">$250.00+</span>
-              <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 text-[10px] font-bold">50x / 60x</span>
-            </div>
-            <div className="font-sans font-semibold text-neutral-200 mt-1">Max Alpha Mode</div>
-            <div className="text-[10px] text-neutral-400 mt-0.5">
-              Risk Cap: 10% ($25.00 max) · High Momentum<br />
-              TP2 Target: +0.85 / +1.20 ATR
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {/* 4. THE 15 INDIVIDUAL STATUS TILES (Directly under the key!) */}
+      {/* THE 15 INDIVIDUAL STATUS TILES */}
       <div className="space-y-2">
         {/* ROW 1: PRIMARY OSCILLATORS & VOLATILITY */}
         <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2.5">
@@ -1157,6 +1049,22 @@ export const LiveDashboardView: React.FC<LiveDashboardViewProps> = ({
           </div>
         </div>
       </div>
+
+      {/* 4 SYNCHRONIZED CHARTS: PRICE CANDLESTICKS, CCI, FISHER, ATR */}
+      <LiveIndicatorCharts
+        candles={chartCandles}
+        currentAsset={currentAsset}
+        timeframe={chartTimeframe}
+        onTimeframeChange={(tf) => setChartTimeframe(tf)}
+      />
+
+      {/* 5. CALCULATOR & TODAY'S TRADES FROM INDEX.HTML */}
+      <DashboardCalculator
+        currentAsset={currentAsset}
+        currentPrice={indicators.price}
+        portfolioBalance={portfolioBalance}
+        onUpdatePortfolioBalance={handleUpdatePortfolioBalance}
+      />
     </div>
   );
 };

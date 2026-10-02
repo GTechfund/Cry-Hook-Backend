@@ -11,6 +11,7 @@ import {
   FlaskConical,
   Clock,
   Layers,
+  Wallet,
 } from 'lucide-react';
 
 export type DashboardWindow = 'LIVE_VIEW' | 'AUTOTRADE' | 'BACKTEST';
@@ -30,6 +31,11 @@ interface HeaderProps {
   onResetDefaults: () => void;
   onExportCSV?: () => void;
   hasTrades?: boolean;
+  portfolioBalance?: number;
+  onUpdatePortfolioBalance?: (newBal: number) => void;
+  openPositionsCount?: number;
+  maxOpenPositions?: number;
+  activeTierName?: string;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -47,7 +53,14 @@ export const Header: React.FC<HeaderProps> = ({
   onResetDefaults,
   onExportCSV,
   hasTrades = false,
+  portfolioBalance = 30.0,
+  onUpdatePortfolioBalance,
+  openPositionsCount = 0,
+  maxOpenPositions = 1,
+  activeTierName = 'Peak Win Rate (20x LSD)',
 }) => {
+  const [isEditingBalance, setIsEditingBalance] = React.useState<boolean>(false);
+  const [balanceInput, setBalanceInput] = React.useState<string>(portfolioBalance.toString());
   const assetGlyph = currentAsset === 'SOL' ? '◎' : currentAsset === 'BTC' ? '₿' : 'Ξ';
 
   return (
@@ -60,13 +73,41 @@ export const Header: React.FC<HeaderProps> = ({
             <span>SOL SNIPER v10.5</span>
           </div>
 
-          {/* High-Visibility Active Asset Highlight Pill */}
-          <div className="flex items-center gap-2 px-3 py-1 rounded-full bg-purple-500/20 text-purple-300 text-xs font-mono font-bold border border-purple-500/50 shadow-sm shadow-purple-500/20 animate-pulse">
-            <span className="text-white text-sm">{assetGlyph}</span>
-            <span>ACTIVE ASSET: {currentAsset}/USDT</span>
-            {solPrice !== undefined && (
-              <span className="text-emerald-400 font-black">${solPrice.toFixed(2)}</span>
+          {/* Live Open Positions Monitor Pill */}
+          <div className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-blue-950/40 text-blue-300 text-xs font-mono font-bold border border-blue-500/40 shadow-sm">
+            <Layers className="w-3.5 h-3.5 text-blue-400" />
+            <span>POSITIONS:</span>
+            <span
+              className={`px-1.5 py-0.2 rounded font-black ${
+                openPositionsCount > 0
+                  ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+                  : 'bg-emerald-500/20 text-emerald-300'
+              }`}
+            >
+              {openPositionsCount} / {maxOpenPositions}
+            </span>
+            {openPositionsCount > 0 ? (
+              <span className="h-1.5 w-1.5 rounded-full bg-amber-400 animate-ping inline-block" />
+            ) : (
+              <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 inline-block" />
             )}
+          </div>
+
+          {/* Portfolio Equity & Active Tier Pill with 1-Click Changer */}
+          <div className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-950/40 text-emerald-300 text-xs font-mono font-bold border border-emerald-500/40">
+            <Wallet className="w-3.5 h-3.5 text-emerald-400" />
+            <span>PORTFOLIO:</span>
+            <span className="text-white font-black">${portfolioBalance.toFixed(2)}</span>
+            <button
+              onClick={() => {
+                setBalanceInput(portfolioBalance.toString());
+                setIsEditingBalance(true);
+              }}
+              className="text-[10px] bg-emerald-500/20 hover:bg-emerald-500/40 text-emerald-200 px-1.5 py-0.5 rounded border border-emerald-500/30 transition-colors cursor-pointer font-bold"
+              title="Change Initial Portfolio Value (e.g. $30.00)"
+            >
+              Change
+            </button>
           </div>
 
           <div className="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400 text-xs font-mono font-semibold border border-emerald-500/30">
@@ -195,16 +236,6 @@ export const Header: React.FC<HeaderProps> = ({
               </button>
             )}
 
-            <a
-              href="/jupiter.js"
-              download="jupiter.js"
-              className="px-2.5 py-1.5 text-xs font-medium rounded-lg bg-indigo-950/40 hover:bg-indigo-900/50 text-indigo-300 border border-indigo-500/30 transition-all flex items-center gap-1.5"
-              title="Download jupiter.js"
-            >
-              <Download className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">jupiter.js</span>
-            </a>
-
             <button
               onClick={onOpenMonteCarlo}
               disabled={isRunning}
@@ -305,16 +336,21 @@ export const Header: React.FC<HeaderProps> = ({
         </div>
 
         {/* Selected View Info Sub-Row */}
-        <div className="flex items-center gap-4 text-[11px] text-neutral-400 mt-2 px-1">
+        <div className="flex items-center gap-4 text-[11px] text-neutral-400 mt-2 px-1 flex-wrap">
           <div className="flex items-center gap-1.5">
-            <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 inline-block"></span>
+            <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 inline-block animate-pulse"></span>
             <span>Live Streaming:</span>
             <strong className="text-neutral-200">ON</strong>
           </div>
           <span className="text-white/20">|</span>
           <div className="flex items-center gap-1.5">
-            <span>Selected Asset:</span>
-            <strong className="text-amber-400">{currentAsset}</strong>
+            <span>Active Tier:</span>
+            <strong className="text-emerald-400">{activeTierName}</strong>
+          </div>
+          <span className="text-white/20">|</span>
+          <div className="flex items-center gap-1.5">
+            <span>Hard Risk Cap:</span>
+            <strong className="text-purple-300">10% (${(portfolioBalance * 0.10).toFixed(2)})</strong>
           </div>
           <span className="text-white/20">|</span>
           <div className="flex items-center gap-1.5">
@@ -327,6 +363,91 @@ export const Header: React.FC<HeaderProps> = ({
           </div>
         </div>
       </div>
+
+      {/* Set Portfolio Value Modal */}
+      {isEditingBalance && (
+        <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-xs flex items-center justify-center p-4 animate-fadeIn">
+          <div className="bg-[#191a1c] border border-white/15 rounded-2xl p-5 max-w-sm w-full space-y-4 shadow-2xl">
+            <div className="flex items-center justify-between pb-2 border-b border-white/10">
+              <div className="flex items-center gap-2">
+                <Wallet className="w-4 h-4 text-emerald-400" />
+                <h3 className="text-sm font-bold text-white">Set Portfolio Value</h3>
+              </div>
+              <button
+                onClick={() => setIsEditingBalance(false)}
+                className="text-neutral-400 hover:text-white text-sm"
+              >
+                ✕
+              </button>
+            </div>
+
+            <p className="text-xs text-neutral-300 leading-relaxed">
+              Enter target trading equity. The <strong>Dynamic Auto-Preset Switcher</strong> will immediately scale leverage, max risk dollar cap, and allowable open positions.
+            </p>
+
+            <div className="space-y-1">
+              <label className="text-[10px] uppercase font-bold text-neutral-400">Equity Amount (USD)</label>
+              <div className="relative">
+                <span className="absolute left-3 top-2 text-neutral-400 font-mono text-sm">$</span>
+                <input
+                  type="number"
+                  step="0.01"
+                  min="5"
+                  value={balanceInput}
+                  onChange={(e) => setBalanceInput(e.target.value)}
+                  className="w-full bg-[#111213] border border-white/15 rounded-lg pl-7 pr-3 py-1.5 text-sm font-mono text-white focus:outline-none focus:border-emerald-500"
+                  placeholder="30.00"
+                />
+              </div>
+            </div>
+
+            {/* Quick Presets */}
+            <div className="space-y-1">
+              <span className="text-[10px] text-neutral-400 block font-medium">Quick Presets:</span>
+              <div className="grid grid-cols-4 gap-1.5">
+                {[
+                  { label: '$30 (T1)', val: 30 },
+                  { label: '$50', val: 50 },
+                  { label: '$100 (T2)', val: 100 },
+                  { label: '$250 (T3)', val: 250 },
+                ].map((item) => (
+                  <button
+                    key={item.val}
+                    type="button"
+                    onClick={() => setBalanceInput(item.val.toString())}
+                    className="py-1 rounded bg-[#25272a] hover:bg-white/10 text-neutral-200 text-[11px] font-mono font-bold transition-colors"
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="flex gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setIsEditingBalance(false)}
+                className="flex-1 py-2 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-xs font-semibold transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const val = parseFloat(balanceInput);
+                  if (!isNaN(val) && val > 0) {
+                    if (onUpdatePortfolioBalance) onUpdatePortfolioBalance(val);
+                    setIsEditingBalance(false);
+                  }
+                }}
+                className="flex-1 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold transition-colors shadow-md"
+              >
+                Save &amp; Sync Tier
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </header>
   );
 };
